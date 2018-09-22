@@ -67,6 +67,9 @@ void deinitWSASockets()
 
 void help()
 {
+	std::cout << "disktypes  - get disk types of the system." << std::endl;
+	std::cout << "owner <file|folder|key> <item_name>  - get owner of the file|folder|key." << std::endl;
+	std::cout << "accright <file|folder|key> <item_name>  - get access rights of the file|folder|key." << std::endl;
 	std::cout << "freemem - get avalible free memory on local disks." << std::endl;
 	std::cout << "meminfo - get memory usage information." << std::endl;
 	std::cout << "stop - correctly shutdown the client." << std::endl;
@@ -96,8 +99,8 @@ const char *OSversion(DWORD major, DWORD minor)
 		else if (minor == 2) return "Windows 8";
 		else if (minor == 3) return "Windows 8.1";
 	default:
-		return NULL;
 		break;
 	}
-	
+
+	return NULL;
 }
