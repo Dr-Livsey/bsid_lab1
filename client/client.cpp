@@ -1,8 +1,10 @@
 #include <iostream>
 #include <string>
 #include <bitset>
+
 #include "wsa_env.h"
 #include "acl_env.h"
+#include "CryptoAPI.h"
 
 #include <boost/lexical_cast.hpp>
 #include <boost/regex.hpp>
@@ -93,7 +95,9 @@ void TCPSocket::connect_to_server(const char *ip, unsigned port)
 class RequestHandler
 {
 public:
-	RequestHandler(SOCKET s) : sh(s) {}
+	CryptoAPI CApi_client;
+
+	RequestHandler(SOCKET s) : sh(s) { is_sKey_establish = false; }
 
 	void get_systime();
 	void get_osb_time();
@@ -107,31 +111,55 @@ private:
 	void send_pack(char *buffer, ULONG buf_size);
 	void recieve_pack();
 	void make_request(unsigned opcode, char *add_inf, ULONG ai_size);
+	void establish_session_key();
 
 	SOCKET sh;
 	char req_buffer[2048];
+	bool is_sKey_establish;
 };
+
+
 
 void RequestHandler::send_pack(char *buffer, ULONG buf_size)
 {
+	PBYTE encrypted_buf = NULL;
 	DWORD lpNumberOfBytesSent, dwFlags = 0;
 	WSABUF buf;
-	buf.buf = buffer;
-	buf.len = buf_size;
+
+	if (is_sKey_establish == true)
+	{
+		DWORD encr_size = buf_size;
+		encrypted_buf = CApi_client.EncryptBuffer((PBYTE)buffer, buf_size, &encr_size);
+		buf.buf = (char*)encrypted_buf;
+		buf.len = encr_size;
+	}
+	else
+	{
+		buf.buf = buffer;
+		buf.len = buf_size * sizeof(char);
+	}
 
 	WSASend(sh, &buf, 1, &lpNumberOfBytesSent, dwFlags, NULL, NULL);
 	error_msg("WSASend");
+
+	if (is_sKey_establish == true) delete[] encrypted_buf;
 }
 void RequestHandler::recieve_pack()
 {
 	DWORD flags = 0;
+	DWORD RecvBytes;
 	WSABUF buffer;
 
 	ZeroMemory(req_buffer, sizeof(char) * 2048);
 	buffer.buf = req_buffer;
 	buffer.len = 2048 * sizeof(char);
 
-	WSARecv(sh, &buffer, 1, NULL, &flags, NULL, NULL);
+	WSARecv(sh, &buffer, 1, &RecvBytes, &flags, NULL, NULL);
+
+	if (is_sKey_establish == true)
+	{
+		CApi_client.DecryptBuffer((PBYTE)req_buffer, &RecvBytes);
+	}
 }
 void RequestHandler::make_request(unsigned opcode, char *add_inf, ULONG ai_size)
 {
@@ -140,11 +168,43 @@ void RequestHandler::make_request(unsigned opcode, char *add_inf, ULONG ai_size)
 	memcpy(req_buffer + sizeof(unsigned), add_inf, ai_size);
 }
 
+void RequestHandler::establish_session_key()
+{
+	is_sKey_establish = false;
+
+	/*Export PublicKey and send it to server.*/
+	CApi_client.GenerateExchangeKey();
+	CApi_client.PublicKey = CApi_client.ExportKey(
+												CApi_client.hExchangeKey,
+												0,
+												PUBLICKEYBLOB,
+												&CApi_client.pbLen);
+	char pbKeyBuf[2048];
+	memcpy(pbKeyBuf, (char*)&CApi_client.pbLen, sizeof(DWORD));
+	memcpy(pbKeyBuf + sizeof(DWORD), (char*)CApi_client.PublicKey, CApi_client.pbLen * sizeof(BYTE));
+	send_pack(pbKeyBuf, sizeof(DWORD) + CApi_client.pbLen * sizeof(BYTE));
+
+	/*Recieve Session Key encrypted with Public Key*/
+	recieve_pack();
+	memcpy((char*)&CApi_client.sLen, req_buffer, sizeof(DWORD));
+	CApi_client.enSessionKey = new BYTE[CApi_client.sLen];
+	memcpy(CApi_client.enSessionKey, req_buffer + sizeof(DWORD), sizeof(BYTE)*CApi_client.sLen);
+
+	/*Decrypt Session Key with Public Key*/
+	CApi_client.DecryptAndImportSessionKey();	
+
+	is_sKey_establish = true;
+}
+
 void RequestHandler::get_systime()
 {
+	establish_session_key();
+
 	unsigned opcode = GET_CTIME;
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 	
 	SYSTEMTIME sm;
@@ -157,9 +217,13 @@ void RequestHandler::get_systime()
 }
 void RequestHandler::get_osb_time()
 {
+	establish_session_key();
+
 	unsigned opcode = GET_OSBTIME;
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 
 	cout << "System time : ";
@@ -175,10 +239,14 @@ void RequestHandler::get_osb_time()
 }
 void RequestHandler::get_osver()
 {
+	establish_session_key();
+
 	unsigned opcode = GET_OSVER;
 
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 
 	OSVERSIONINFOEX osvi;
@@ -189,10 +257,14 @@ void RequestHandler::get_osver()
 }
 void RequestHandler::get_meminf()
 {
+	establish_session_key();
+
 	unsigned opcode = GET_MEMINF;
 
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 
 	MEMORYSTATUS stat;
@@ -212,10 +284,14 @@ void RequestHandler::get_meminf()
 }
 void RequestHandler::get_freemem()
 {
+	establish_session_key();
+
 	unsigned opcode = GET_FREEMEM;
 
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 
 	unsigned disk_amount;
@@ -237,6 +313,8 @@ void RequestHandler::get_freemem()
 }
 void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 {
+	establish_session_key();
+
 	setlocale(0, "RUS");
 	char tmp[128];
 	unsigned short cmd_len = (unsigned short)(cmd.length() + 1);
@@ -256,7 +334,10 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 
 	/*Receive error code of operation.*/
 	DWORD err;
+
+	establish_session_key();
 	recieve_pack();
+
 	memcpy((char*)&err, req_buffer, sizeof(DWORD));
 
 	if (err != ERROR_SUCCESS)
@@ -268,6 +349,7 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 	}
 
 	/*Receive information pack.*/
+	establish_session_key();
 	recieve_pack();
 
 	if (opcode == GET_OWNER)
@@ -322,6 +404,8 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 }
 void RequestHandler::get_disktypes()
 {
+	establish_session_key();
+
 	const char *DT[] = {
 	{  "DRIVE_UNKNOWN" },
 	{  "DRIVE_NO_ROOT_DIR"},
@@ -334,6 +418,8 @@ void RequestHandler::get_disktypes()
 
 	make_request(opcode, NULL, 0);
 	send_pack(req_buffer, strlen(req_buffer));
+
+	establish_session_key();
 	recieve_pack();
 
 	WORD disk_amount, offset = sizeof(WORD);
@@ -369,7 +455,6 @@ void addr_verify(string &addr_string, unsigned *port)
 		addr_string = matches.str(1);
 	}
 }
-
 bool regexp_verify(string ideal, boost::smatch &m, string test)
 {
 	boost::smatch matches;
@@ -382,22 +467,22 @@ int main(int argc, char *argv[])
 {
 	string user_addr;
 	unsigned port = 19001;
-	const char *ip = "127.0.0.1";
+	const char *ip = NULL;
 
 	cout << "Specify server addres: xxx.xxx.xxx.xxx:xxxxx\n" << endl << ">";
-	//while (ip == NULL)
-	//{
-	//	try
-	//	{
-	//		std::getline(std::cin, user_addr);
-	//		addr_verify(user_addr, &port);
-	//		ip = user_addr.c_str();
-	//	}
-	//	catch (const std::exception &e)
-	//	{
-	//		cout << e.what() << endl << ">";
-	//	}
-	//}
+	while (ip == NULL)
+	{
+		try
+		{
+			std::getline(std::cin, user_addr);
+			addr_verify(user_addr, &port);
+			ip = user_addr.c_str();
+		}
+		catch (const std::exception &e)
+		{
+			cout << e.what() << endl << endl << ">";
+		}
+	}
 
 	initWSASockets();
 	TCPSocket client;
@@ -423,7 +508,7 @@ int main(int argc, char *argv[])
 	{
 		cout << ">";
 		std::getline(std::cin, cmd_line);
-
+	
 		if (cmd_line == "sys time"){ rhandler.get_systime(); continue; }
 		else if (cmd_line == "disktypes") { rhandler.get_disktypes(); continue; }
 		else if (cmd_line == "freemem"){ rhandler.get_freemem(); continue; }
