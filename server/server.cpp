@@ -1,6 +1,8 @@
 #include <iostream>
-#include "wsa_env.h"
+#include <string>
+#include <boost/lexical_cast.hpp>
 
+#include "wsa_env.h"
 
 using std::cout;
 using std::endl;
@@ -8,13 +10,21 @@ using std::endl;
 #define clean_olp(olp) memset(&olp, 0, sizeof(OVERLAPPED));
 #pragma warning(disable : 4996)
 
+class TCPServer;
+
 struct client
 {
+	client() : is_sKey_establish(false) {}
+
+	CryptoAPI capi;
+	bool is_sKey_establish;
+
 	SOCKET sock;
 
 	OVERLAPPED overlap_r;
 	OVERLAPPED overlap_s;
 	OVERLAPPED overlap_c;
+	OVERLAPPED overlap_encr;
 
 	char request[2048];
 
@@ -34,12 +44,101 @@ struct VolInf
 	char  lpRootPathName[4];
 	char   FSname[MAX_PATH + 1];
 };
+class TCPServer
+{
+public:
+	HANDLE iocp;
+	HANDLE tiocp;
+	SOCKET s;
+
+	TCPServer(unsigned port)
+	{
+		try
+		{
+			s = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+			error_msg("WSASocket");
+
+			sockaddr_in serv_addr;
+			memset(serv_addr.sin_zero, 0, sizeof(char) * 8);
+			serv_addr.sin_port = htons(port);
+			serv_addr.sin_family = AF_INET;
+			serv_addr.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
+
+			bind(s, (sockaddr*)&serv_addr, sizeof(serv_addr));
+			error_msg("bind");
+
+			listen(s, 512);
+			error_msg("Liten");
+
+			iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)0, 0);
+			error_msg("CreateIoCompletionPort");
+
+			tiocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)0, 0);
+			error_msg("CreateIoCompletionPort");
+
+			CreateIoCompletionPort((HANDLE)s, iocp, (ULONG_PTR)s, 0);
+			error_msg("CreateIoCompletionPort.for listen");
+
+			cout << "Listen " << port << endl;
+
+			create_pool();
+
+			schedule_accept();
+		}
+		catch (const std::exception &e)
+		{
+			cout << "Exception in: " << e.what() << endl;
+		}
+
+	}
+
+	client* get_client(SOCKET sock) { return cmap[sock]; }
+	void remove_client(SOCKET s)
+	{
+		delete cmap[s];
+		cmap.erase(s);
+		closesocket(s);
+	}
+
+	void schedule_accept();
+	void schedule_request(client *c);
+	void schedule_cancel(client *c);
+	void schedule_pubKey(client *c);
+
+	void accept_handler();
+
+	~TCPServer()
+	{
+		for (auto i = cmap.begin(); i != cmap.end(); i++)
+		{
+			closesocket(i->first);
+			delete i->second;
+		}
+
+		cmap.clear();
+		closesocket(s);
+		CloseHandle(threads[0]);
+		CloseHandle(threads[1]);
+		CloseHandle(iocp);
+		CloseHandle(tiocp);
+	}
+
+private:
+	SOCKET accepted_socket;
+	std::map<SOCKET, client*> cmap;
+	CHAR connection_buf[1024];
+	OVERLAPPED overlap;
+
+	void create_pool();
+	static DWORD WINAPI PoolWorking(LPVOID lpParam);
+	HANDLE threads[2];
+};
 
 class RequestHandler
 {
 public:
 	RequestHandler() {}
-	void handle_request(client *c);
+	void handle_request(TCPServer &s, client *c, DWORD RecvBytes);
 
 private:
 	void send_pack(client *c, char *buffer, ULONG buf_size);
@@ -49,63 +148,137 @@ private:
 	void send_osver(client *c);
 	void send_meminf(client *c);
 	void send_freemem(client *c);
-	void send_accrights(unsigned opcode, client *c);
+	void send_accrights(unsigned opcode, client *c, TCPServer &s);
 	void send_disktypes(client *c);
+
+	//Crypter
+	void establish_session_key(client *c);
+	void wait_pbKey(client *c);
 };
+
+void RequestHandler::establish_session_key(client *c)
+{
+	/*Recieve Public key from client*/
+	memcpy((char*)&c->capi.pbLen, c->request, sizeof(DWORD));
+	c->capi.PublicKey = new BYTE[c->capi.pbLen];
+	memcpy(c->capi.PublicKey, c->request + sizeof(DWORD), c->capi.pbLen * sizeof(BYTE));
+
+	c->capi.GenerateSessionKey();
+	c->capi.EncryptAndExportSessionKey();
+
+	/*Send session key encrypted with public key to client.*/
+	char sKeyBuf[2048];
+	memcpy(sKeyBuf, (char*)&c->capi.sLen, sizeof(DWORD));
+	memcpy(sKeyBuf + sizeof(DWORD), (char*)c->capi.enSessionKey, c->capi.sLen * sizeof(BYTE));
+	send_pack(c, sKeyBuf, sizeof(DWORD) + c->capi.sLen * sizeof(BYTE));
+
+	c->is_sKey_establish = true;
+}
+
+void RequestHandler::wait_pbKey(client * c)
+{
+	DWORD bytes_tr, flags;
+	WSAGetOverlappedResult(c->sock, &c->overlap_encr, &bytes_tr, TRUE, &flags);
+
+	//ZeroMemory(c->request, sizeof(char) * 2048);
+	//WSABUF buffer;
+	//DWORD flags;
+	//OVERLAPPED e;
+	//buffer.buf = c->request;
+	//buffer.len = 2048 * sizeof(char);
+
+	//clean_olp(e);
+	//e.hEvent = WSACreateEvent();
+	//WSARecv(c->sock, &buffer, 1, NULL, &flags, &e, NULL);
+	//WSAWaitForMultipleEvents(1, &e.hEvent, TRUE, INFINITE, FALSE);
+}
 
 void RequestHandler::send_pack(client *c, char *buffer, ULONG buf_size)
 {
+	PBYTE encrypted_buf = NULL;
 	DWORD lpNumberOfBytesSent, dwFlags = 0;
 	WSABUF buf;
-	buf.buf = buffer;
-	buf.len = buf_size;
+
+	if (c->is_sKey_establish == true)
+	{
+		DWORD encr_size = buf_size;
+		encrypted_buf = c->capi.EncryptBuffer((PBYTE)buffer, (DWORD)buf_size, &encr_size);
+		buf.buf = (char*)encrypted_buf;
+		buf.len = encr_size;
+	}
+	else
+	{
+		buf.buf = buffer;
+		buf.len = buf_size * sizeof(char);
+	}
 
 	clean_olp(c->overlap_s);
 	WSASend(c->sock, &buf, 1, &lpNumberOfBytesSent, dwFlags, &c->overlap_s, NULL);
 	error_msg("WSASend");
+
+	if (c->is_sKey_establish) delete[] encrypted_buf;
 }
-void RequestHandler::handle_request(client *c)
+void RequestHandler::handle_request(TCPServer &s, client *c, DWORD RecvBytes)
 {
+	if (c->is_sKey_establish == false)
+	{
+		establish_session_key(c);
+		return;
+	}
+
+	c->capi.DecryptBuffer((PBYTE)c->request, &RecvBytes);
+	c->is_sKey_establish = false;
+
 	unsigned opcode;
 	memcpy((char*)&opcode, c->request, sizeof(unsigned));
 
 	switch (opcode)
 	{
 	case GET_CTIME:
+		s.schedule_pubKey(c);
 		send_systime(c);
 		break;
 	case GET_OSBTIME:
+		s.schedule_pubKey(c);
 		send_osbtime(c);
 		break;
 	case GET_OSVER:
+		s.schedule_pubKey(c);
 		send_osver(c);
 		break;
 	case GET_MEMINF:
+		s.schedule_pubKey(c);
 		send_meminf(c);
 		break;
 	case GET_FREEMEM:
+		s.schedule_pubKey(c);
 		send_freemem(c);
 		break;
 	case GET_ACCRIGHTS:
-		send_accrights(opcode, c);
+		send_accrights(opcode, c, s);
 		break;
 	case GET_OWNER:
-		send_accrights(opcode, c);
+		send_accrights(opcode, c, s);
 		break;
 	case GET_DISKTYPES:
+		s.schedule_pubKey(c);
 		send_disktypes(c);
 		break;
 	default:
 		break;
 	}
-
 }
 
 void RequestHandler::send_systime(client *c)
 {
 	SYSTEMTIME sm;
 	GetSystemTime(&sm);
+
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, (char*)&sm, sizeof(sm));
+	c->is_sKey_establish = false;
 }
 void RequestHandler::send_osbtime(client *c)
 {
@@ -115,9 +288,14 @@ void RequestHandler::send_osbtime(client *c)
 	osbtime[1] = osbtime[3] / (1000 * 60) - osbtime[0] * 60;
 	osbtime[2] = (osbtime[3] / 1000) - (osbtime[0] * 60 * 60) - osbtime[1] * 60;
 	osbtime[3] = osbtime[3] - osbtime[0] * 60 * 60 * 1000 - osbtime[1] * 60 * 1000 - osbtime[2] * 1000;
-
+	
+	wait_pbKey(c);
+	establish_session_key(c);
+	
 	send_pack(c, (char*)&osbtime, sizeof(DWORD) * 4);
+	c->is_sKey_establish = false;
 }
+
 void RequestHandler::send_osver(client *c)
 {
 	OSVERSIONINFOEX osvi;
@@ -125,13 +303,22 @@ void RequestHandler::send_osver(client *c)
 	osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
 	GetVersionEx((LPOSVERSIONINFOA)&osvi);
 
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, (char*)&osvi, sizeof(OSVERSIONINFOEX));
+	c->is_sKey_establish = false;
 }
 void RequestHandler::send_meminf(client *c)
 {
 	MEMORYSTATUS stat;
 	GlobalMemoryStatus(&stat);
+
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, (char*)&stat, sizeof(MEMORYSTATUS));
+	c->is_sKey_establish = false;
 }
 void RequestHandler::send_freemem(client *c)
 {
@@ -139,7 +326,7 @@ void RequestHandler::send_freemem(client *c)
 	char send_buf[2048] = { 0 };
 	unsigned dam = 0;
 	char ldisks[26][3];
-
+	
 	for (int i = 0; i < 26; i++)
 	{
 		if ((ldisks_mask >> i) & 1)
@@ -164,9 +351,14 @@ void RequestHandler::send_freemem(client *c)
 	}
 
 	memcpy(send_buf, (char*)&dam, sizeof(unsigned));
+
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, (char*)&send_buf, sizeof(unsigned) + dam * (3 + sizeof(long double)));
+	c->is_sKey_establish = false;
 }
-void RequestHandler::send_accrights(unsigned opcode, client *c)
+void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 {
 	char item[128], cmd[10];
 	unsigned short size, offset;
@@ -177,6 +369,8 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 
 	memcpy((char*)&size, &c->request[4] + offset, sizeof(unsigned short));
 	memcpy((char*)&item, &c->request[4] + sizeof(unsigned short) + offset, size);
+
+	s.schedule_pubKey(c);
 
 	PACL  ppDacl;
 	PSECURITY_DESCRIPTOR ppSD;
@@ -218,10 +412,15 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 										&ppSD);
 	char buffer[2048];
 
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	if (retval != ERROR_SUCCESS)
 	{
 		memcpy(buffer, (char*)&retval, sizeof(DWORD));
 		send_pack(c, buffer, sizeof(DWORD));
+		c->is_sKey_establish = false;
+
 		LocalFree(ppSD);
 		return;
 	}
@@ -239,6 +438,9 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 			&eSidType))
 		{
 			send_pack(c, (char*)&retval, sizeof(retval));
+			c->is_sKey_establish = false;
+
+			s.schedule_pubKey(c);
 
 			ACEitem acei;
 			DWORD SidLength = GetLengthSid(ppsidOwner);
@@ -253,6 +455,8 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 			memcpy(buffer + sizeof(ACEitem) + sizeof(DWORD), StringSid, SidLength);
 			delete StringSid;
 
+			wait_pbKey(c);
+			establish_session_key(c);
 			send_pack(c, buffer, sizeof(DWORD) + sizeof(ACEitem) + SidLength);
 		}
 		else
@@ -261,6 +465,7 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 			memcpy(buffer, (char*)&retval, sizeof(DWORD));
 			send_pack(c, buffer, sizeof(DWORD));
 		}
+		c->is_sKey_establish = false;
 
 		return;
 	}
@@ -274,12 +479,17 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 	{
 		retval = GetLastError();
 		memcpy(buffer, (char*)&retval, sizeof(DWORD));
+
 		send_pack(c, buffer, sizeof(DWORD));
+		c->is_sKey_establish = false;
 		return;
 	}
 
 	/*Send error_code = 0*/
 	send_pack(c, (char*)&retval, sizeof(retval));
+	c->is_sKey_establish = false;
+
+	s.schedule_pubKey(c);
 
 	ACCESS_ALLOWED_ACE * pAce = NULL;
 	WORD aceamount = 0;
@@ -326,9 +536,15 @@ void RequestHandler::send_accrights(unsigned opcode, client *c)
 	}
 
 	memcpy(buffer, (char*)&aceamount, sizeof(WORD));
+
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, buffer, offset);
+	c->is_sKey_establish = false;
 
 	LocalFree(ppSD);
+
 }
 void RequestHandler::send_disktypes(client *c)
 {
@@ -364,101 +580,15 @@ void RequestHandler::send_disktypes(client *c)
 		}
 	}
 	memcpy(buffer, (char*)&disk_amount, sizeof(WORD));
+
+	wait_pbKey(c);
+	establish_session_key(c);
+
 	send_pack(c, buffer, offset);
+	c->is_sKey_establish = false;
 }
 
-
 typedef std::map<SOCKET, client*> client_id;
-
-class TCPServer
-{
-public:
-	HANDLE iocp;
-	HANDLE tiocp;
-	SOCKET s;
-
-	TCPServer(unsigned port)
-	{
-		try
-		{
-			s = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
-			error_msg("WSASocket");
-
-			sockaddr_in serv_addr;
-			memset(serv_addr.sin_zero, 0, sizeof(char) * 8);
-			serv_addr.sin_port = htons(port);
-			serv_addr.sin_family = AF_INET;
-			serv_addr.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
-
-			bind(s, (sockaddr*)&serv_addr, sizeof(serv_addr));
-			error_msg("bind");
-
-			listen(s, 512);
-			error_msg("Liten");
-
-			iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)0, 0);
-			error_msg("CreateIoCompletionPort");
-
-			tiocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)0, 0);
-			error_msg("CreateIoCompletionPort");
-
-			CreateIoCompletionPort((HANDLE)s, iocp, (ULONG_PTR)s, 0);
-			error_msg("CreateIoCompletionPort.for listen");
-
-			cout << "Listen " << port << endl;
-
-			create_pool();
-
-			schedule_accept();
-		}
-		catch (const std::exception &e)
-		{
-			cout << "Exception in: " << e.what() << endl;
-		}
-	
-	}
-
-	client* get_client(SOCKET sock) { return cmap[sock]; }
-	void remove_client(SOCKET s) 
-	{ 
-		delete cmap[s];
-		cmap.erase(s);
-		closesocket(s);  
-	}
-
-	void schedule_accept();
-	void schedule_request(client *c);
-	void schedule_cancel(client *c);
-	
-	void accept_handler();
-
-	~TCPServer() 
-	{ 
-		for (auto i = cmap.begin(); i != cmap.end(); i++)
-  		{  
-			closesocket(i->first);
-			delete i->second;
-		}
-
-		cmap.clear();
-		closesocket(s); 
-		CloseHandle(threads[0]);
-		CloseHandle(threads[1]);
-		CloseHandle(iocp);
-		CloseHandle(tiocp);
-	}
-
-private:
-	SOCKET accepted_socket;
-	std::map<SOCKET, client*> cmap;
-	CHAR connection_buf[1024];
-	OVERLAPPED overlap;
-
-	void create_pool();
-	static DWORD WINAPI PoolWorking(LPVOID lpParam);
-	HANDLE threads[2];
-};
-
 
 DWORD WINAPI TCPServer::PoolWorking(LPVOID server)
 {
@@ -494,7 +624,7 @@ DWORD WINAPI TCPServer::PoolWorking(LPVOID server)
 				}
 				else
 				{
-					rhandler.handle_request(cur_client);
+					rhandler.handle_request(*pServer, cur_client, transfered);
 					pServer->schedule_request(cur_client);
 				}
 			}
@@ -576,6 +706,26 @@ void TCPServer::schedule_cancel(client *c)
 		cout << "Exception in: " << e.what() << endl;
 	}
 }
+void TCPServer::schedule_pubKey(client * c)
+{
+	DWORD flags = 0;
+	WSABUF buffer;
+
+	ZeroMemory(c->request, sizeof(char) * 2048);
+	buffer.buf = c->request;
+	buffer.len = 2048 * sizeof(char);
+
+	clean_olp(c->overlap_encr);
+	try
+	{
+		WSARecv(c->sock, &buffer, 1, NULL, &flags, &c->overlap_encr, NULL);
+		error_msg("WSARecv");
+	}
+	catch (const std::exception &e)
+	{
+		cout << "Exception in: " << e.what() << endl;
+	}
+}
 void TCPServer::accept_handler()
 {
 	client *new_cli = new client;
@@ -609,9 +759,30 @@ void TCPServer::accept_handler()
 
 int main()
 {
-	initWSASockets();
-	TCPServer server(19001);
+	cout << "Specify the bind port: xxxxx\n" << endl;
 
+	unsigned port;
+	while (true)
+	{
+		std::string sport;
+
+		cout << ">";
+		std::getline(std::cin, sport);
+
+		try
+		{
+			port = boost::lexical_cast<unsigned>(sport);
+			cout << endl;
+			break;
+		}
+		catch (const boost::bad_lexical_cast &blc)
+		{
+			cout << blc.what() << endl << endl;
+		}
+	}
+
+	initWSASockets();
+	TCPServer server(port);
 	RequestHandler rhandler;
 
 	/*Accept Connections.*/
@@ -647,6 +818,7 @@ int main()
 
 					server.remove_client(cur_client->sock);
 				}
+				else if (&cur_client->overlap_encr == overlap) continue;
 			}
 		}
 	}
