@@ -4,13 +4,13 @@
 #pragma once
 
 #include <winerror.h>
-#include <windows.h>
 #include <winsock2.h>
 #include <mswsock.h>
 #include <conio.h>
 #include <map>
 #include <aclapi.h>
 #include <sddl.h>
+#include "CryptoAPI.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "wsock32.lib")
