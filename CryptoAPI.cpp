@@ -92,38 +92,100 @@ PBYTE CryptoAPI::ExportKey(HCRYPTKEY hKey, HCRYPTKEY hExpKey, DWORD BlobType, DW
 
 PBYTE CryptoAPI::EncryptBuffer(BYTE *buffer, DWORD BufLen, DWORD *TotalSize)
 {
-	DWORD slast = BufLen;
-	CryptEncrypt(SessionKey,
-				NULL,
-				TRUE,
-				0,
-				NULL,
-				&BufLen,
-				*TotalSize);
+	const size_t block_size = 16;
+	BYTE chunk[block_size] = { 0 };
 
-	BYTE *result_buf = new BYTE[BufLen];
-	std::copy_n(buffer, slast, result_buf);
-	
-	(*TotalSize) = BufLen;
+	DWORD chunk_size;
+	DWORD plain_size = BufLen;
+	DWORD offset = 0;
+	DWORD encryption_size = BufLen;
+
+	bool is_final = false;
 
 	CryptEncrypt(SessionKey,
+		NULL,
+		TRUE,
+		0,
+		NULL,
+		&encryption_size,
+		*TotalSize);
+
+	BYTE *result_buf = new BYTE[encryption_size];
+	ZeroMemory(result_buf, sizeof(BYTE) * encryption_size);
+
+	while (plain_size)
+	{
+		ZeroMemory(chunk, sizeof(BYTE) * 16);
+		if (plain_size >= block_size)
+		{
+			memcpy(chunk, buffer + offset, block_size);
+			plain_size -= block_size;
+			chunk_size = block_size;
+		}
+		else
+		{
+			memcpy(chunk, buffer + offset, plain_size);
+			chunk_size = plain_size;
+			plain_size = 0;
+			is_final = true;
+		}
+
+		CryptEncrypt(SessionKey,
 			NULL,
-			TRUE,
+			is_final,
 			0,
-			result_buf,
-			&slast,
-			*TotalSize);
+			chunk,
+			&chunk_size,
+			block_size);
 
+		memcpy(result_buf + offset, chunk, sizeof(BYTE) * chunk_size);
+		offset += chunk_size;
+	}
+
+	*TotalSize = offset;
 	return result_buf;
 }
 
+
 void CryptoAPI::DecryptBuffer(BYTE *buffer, DWORD *BufLen)
 {
-	 CryptDecrypt(SessionKey,
-				NULL,
-				0,
-				FALSE,
-				buffer,
-				BufLen);
+	const size_t block_size = 16;
+	BYTE chunk[block_size] = { 0 };
+
+	DWORD chunk_size;
+	DWORD cipher_size = *BufLen;
+	DWORD offset = 0;
+
+	bool is_final = false;
+
+	while (cipher_size)
+	{
+		ZeroMemory(chunk, sizeof(BYTE) * block_size);
+		if (cipher_size > block_size)
+		{
+			memcpy(chunk, buffer + offset, block_size);
+			cipher_size -= block_size;
+			chunk_size = block_size;
+		}
+		else
+		{
+			memcpy(chunk, buffer + offset, cipher_size);
+			chunk_size = cipher_size;
+			cipher_size = 0;
+			is_final = true;
+		}
+
+		CryptDecrypt(SessionKey,
+			NULL,
+			is_final,
+			0,
+			chunk,
+			&chunk_size);
+
+		memcpy(buffer + offset, chunk, sizeof(BYTE) * chunk_size);
+		offset += chunk_size;
+	}
+
+	*BufLen = offset;
 }
 
