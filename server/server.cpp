@@ -50,6 +50,7 @@ class TCPServer
 public:
 	HANDLE iocp;
 	HANDLE tiocp;
+	HANDLE crypt_iocp;
 	SOCKET s;
 
 	TCPServer(unsigned port)
@@ -122,6 +123,7 @@ public:
 		CloseHandle(threads[1]);
 		CloseHandle(iocp);
 		CloseHandle(tiocp);
+		CloseHandle(crypt_iocp);
 	}
 
 private:
@@ -179,6 +181,7 @@ void RequestHandler::establish_session_key(client *c)
 void RequestHandler::wait_pbKey(client * c)
 {
 	DWORD bytes_tr, flags;
+	Sleep(100);
 	WSAGetOverlappedResult(c->sock, &c->overlap_encr, &bytes_tr, TRUE, &flags);
 }
 
