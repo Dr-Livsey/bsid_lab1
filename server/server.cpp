@@ -27,6 +27,7 @@ struct client
 	OVERLAPPED overlap_encr;
 
 	char request[2048];
+	char keybuf[2048];
 
 	const char *ip;
 	unsigned port;
@@ -159,9 +160,9 @@ private:
 void RequestHandler::establish_session_key(client *c)
 {
 	/*Recieve Public key from client*/
-	memcpy((char*)&c->capi.pbLen, c->request, sizeof(DWORD));
+	memcpy((char*)&c->capi.pbLen, c->keybuf, sizeof(DWORD));
 	c->capi.PublicKey = new BYTE[c->capi.pbLen];
-	memcpy(c->capi.PublicKey, c->request + sizeof(DWORD), c->capi.pbLen * sizeof(BYTE));
+	memcpy(c->capi.PublicKey, c->keybuf + sizeof(DWORD), c->capi.pbLen * sizeof(BYTE));
 
 	c->capi.GenerateSessionKey();
 	c->capi.EncryptAndExportSessionKey();
@@ -179,18 +180,6 @@ void RequestHandler::wait_pbKey(client * c)
 {
 	DWORD bytes_tr, flags;
 	WSAGetOverlappedResult(c->sock, &c->overlap_encr, &bytes_tr, TRUE, &flags);
-
-	//ZeroMemory(c->request, sizeof(char) * 2048);
-	//WSABUF buffer;
-	//DWORD flags;
-	//OVERLAPPED e;
-	//buffer.buf = c->request;
-	//buffer.len = 2048 * sizeof(char);
-
-	//clean_olp(e);
-	//e.hEvent = WSACreateEvent();
-	//WSARecv(c->sock, &buffer, 1, NULL, &flags, &e, NULL);
-	//WSAWaitForMultipleEvents(1, &e.hEvent, TRUE, INFINITE, FALSE);
 }
 
 void RequestHandler::send_pack(client *c, char *buffer, ULONG buf_size)
@@ -222,6 +211,7 @@ void RequestHandler::handle_request(TCPServer &s, client *c, DWORD RecvBytes)
 {
 	if (c->is_sKey_establish == false)
 	{
+		memcpy(c->keybuf, c->request, 2048);
 		establish_session_key(c);
 		return;
 	}
@@ -229,29 +219,26 @@ void RequestHandler::handle_request(TCPServer &s, client *c, DWORD RecvBytes)
 	c->capi.DecryptBuffer((PBYTE)c->request, &RecvBytes);
 	c->is_sKey_establish = false;
 
+	s.schedule_pubKey(c);
+
 	unsigned opcode;
 	memcpy((char*)&opcode, c->request, sizeof(unsigned));
 
 	switch (opcode)
 	{
 	case GET_CTIME:
-		s.schedule_pubKey(c);
 		send_systime(c);
 		break;
 	case GET_OSBTIME:
-		s.schedule_pubKey(c);
 		send_osbtime(c);
 		break;
 	case GET_OSVER:
-		s.schedule_pubKey(c);
 		send_osver(c);
 		break;
 	case GET_MEMINF:
-		s.schedule_pubKey(c);
 		send_meminf(c);
 		break;
 	case GET_FREEMEM:
-		s.schedule_pubKey(c);
 		send_freemem(c);
 		break;
 	case GET_ACCRIGHTS:
@@ -261,7 +248,6 @@ void RequestHandler::handle_request(TCPServer &s, client *c, DWORD RecvBytes)
 		send_accrights(opcode, c, s);
 		break;
 	case GET_DISKTYPES:
-		s.schedule_pubKey(c);
 		send_disktypes(c);
 		break;
 	default:
@@ -370,8 +356,6 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 	memcpy((char*)&size, &c->request[4] + offset, sizeof(unsigned short));
 	memcpy((char*)&item, &c->request[4] + sizeof(unsigned short) + offset, size);
 
-	s.schedule_pubKey(c);
-
 	PACL  ppDacl;
 	PSECURITY_DESCRIPTOR ppSD;
 	PSID ppsidOwner;
@@ -443,9 +427,20 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 			s.schedule_pubKey(c);
 
 			ACEitem acei;
-			DWORD SidLength = GetLengthSid(ppsidOwner);
-			LPSTR StringSid = new CHAR[SidLength];
-			ConvertSidToStringSid(ppsidOwner, &StringSid);
+			LPSTR StringSid;
+			DWORD SidLength;
+			if (ppsidOwner == NULL)
+			{
+				SidLength = strlen("No owner SID") + 1;
+				StringSid = new CHAR[SidLength];
+				memcpy(StringSid, "No owner SID", SidLength);
+			}
+			else
+			{
+				StringSid = new CHAR[512];
+				ConvertSidToStringSid(ppsidOwner, &StringSid);
+				SidLength = strlen(StringSid) + 1;
+			}
 			
 			memcpy(acei.Name, Name, (NameBufferSize + 1) * sizeof(CHAR));
 			acei.SidType = eSidType;
@@ -466,7 +461,7 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 			send_pack(c, buffer, sizeof(DWORD));
 		}
 		c->is_sKey_establish = false;
-
+		LocalFree(ppSD);
 		return;
 	}
 
@@ -482,6 +477,7 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 
 		send_pack(c, buffer, sizeof(DWORD));
 		c->is_sKey_establish = false;
+		LocalFree(ppSD);
 		return;
 	}
 
@@ -513,10 +509,12 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 				&DomainBufferSize,
 				&eSidType))
 			{
-				struct ACEitem acei;
-				DWORD SidLength = GetLengthSid(&pAce->SidStart);
-				LPSTR StringSid = new CHAR[SidLength];
+				ACEitem acei;
+				LPSTR StringSid;
+				DWORD SidLength;
+				StringSid = new CHAR[512];
 				ConvertSidToStringSid(&pAce->SidStart, &StringSid);
+				SidLength = strlen(StringSid) + 1;
 	
 				memcpy((char*)&acei.pAce, pAce, sizeof(ACCESS_ALLOWED_ACE));
 				memcpy(acei.Name, Name, (NameBufferSize + 1)* sizeof(CHAR));
@@ -544,7 +542,6 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 	c->is_sKey_establish = false;
 
 	LocalFree(ppSD);
-
 }
 void RequestHandler::send_disktypes(client *c)
 {
@@ -711,8 +708,8 @@ void TCPServer::schedule_pubKey(client * c)
 	DWORD flags = 0;
 	WSABUF buffer;
 
-	ZeroMemory(c->request, sizeof(char) * 2048);
-	buffer.buf = c->request;
+	ZeroMemory(c->keybuf, sizeof(char) * 2048);
+	buffer.buf = c->keybuf;
 	buffer.len = 2048 * sizeof(char);
 
 	clean_olp(c->overlap_encr);
