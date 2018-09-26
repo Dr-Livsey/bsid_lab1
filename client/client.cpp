@@ -140,6 +140,15 @@ void RequestHandler::send_pack(char *buffer, ULONG buf_size)
 	}
 
 	WSASend(sh, &buf, 1, &lpNumberOfBytesSent, dwFlags, NULL, NULL);
+	
+	if (WSAECONNRESET == WSAGetLastError())
+	{
+		closesocket(sh);
+		cout << "Connection reset." << endl;
+		Sleep(500);
+		exit(EXIT_FAILURE);
+	}
+
 	error_msg("WSASend");
 
 	if (is_sKey_establish == true) delete[] encrypted_buf;
@@ -155,6 +164,14 @@ void RequestHandler::recieve_pack()
 	buffer.len = 2048 * sizeof(char);
 
 	WSARecv(sh, &buffer, 1, &RecvBytes, &flags, NULL, NULL);
+
+	if (WSAECONNRESET == WSAGetLastError())
+	{
+		closesocket(sh);
+		cout << "Connection reset." << endl;
+		Sleep(500);
+		exit(EXIT_FAILURE);
+	}
 
 	if (is_sKey_establish == true)
 	{
