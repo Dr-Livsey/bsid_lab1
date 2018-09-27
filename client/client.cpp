@@ -95,7 +95,7 @@ void TCPSocket::connect_to_server(const char *ip, unsigned port)
 class RequestHandler
 {
 public:
-	CryptoAPI CApi_client;
+	CryptoAPI CApi_client[2];
 
 	RequestHandler(SOCKET s) : sh(s) { is_sKey_establish = false; }
 
@@ -108,10 +108,10 @@ public:
 	void get_disktypes();
 private:
 	RequestHandler() {}
-	void send_pack(char *buffer, ULONG buf_size);
-	void recieve_pack();
+	void send_pack(char *buffer, ULONG buf_size, WORD keynum);
+	void recieve_pack(WORD keynum);
 	void make_request(unsigned opcode, char *add_inf, ULONG ai_size);
-	void establish_session_key();
+	void establish_session_keys();
 
 	SOCKET sh;
 	char req_buffer[2048];
@@ -120,7 +120,7 @@ private:
 
 
 
-void RequestHandler::send_pack(char *buffer, ULONG buf_size)
+void RequestHandler::send_pack(char *buffer, ULONG buf_size, WORD keynum)
 {
 	PBYTE encrypted_buf = NULL;
 	DWORD lpNumberOfBytesSent, dwFlags = 0;
@@ -129,7 +129,7 @@ void RequestHandler::send_pack(char *buffer, ULONG buf_size)
 	if (is_sKey_establish == true)
 	{
 		DWORD encr_size = buf_size;
-		encrypted_buf = CApi_client.EncryptBuffer((PBYTE)buffer, buf_size, &encr_size);
+		encrypted_buf = CApi_client[keynum].EncryptBuffer((PBYTE)buffer, buf_size, &encr_size);
 		buf.buf = (char*)encrypted_buf;
 		buf.len = encr_size;
 	}
@@ -153,7 +153,7 @@ void RequestHandler::send_pack(char *buffer, ULONG buf_size)
 
 	if (is_sKey_establish == true) delete[] encrypted_buf;
 }
-void RequestHandler::recieve_pack()
+void RequestHandler::recieve_pack(WORD keynum)
 {
 	DWORD flags = 0;
 	DWORD RecvBytes;
@@ -175,7 +175,7 @@ void RequestHandler::recieve_pack()
 
 	if (is_sKey_establish == true)
 	{
-		CApi_client.DecryptBuffer((PBYTE)req_buffer, &RecvBytes);
+		CApi_client[keynum].DecryptBuffer((PBYTE)req_buffer, &RecvBytes);
 	}
 }
 void RequestHandler::make_request(unsigned opcode, char *add_inf, ULONG ai_size)
@@ -185,44 +185,87 @@ void RequestHandler::make_request(unsigned opcode, char *add_inf, ULONG ai_size)
 	memcpy(req_buffer + sizeof(unsigned), add_inf, ai_size);
 }
 
-void RequestHandler::establish_session_key()
+/*Send always keynum = 0, recieve - 1*/
+void RequestHandler::establish_session_keys()
 {
 	is_sKey_establish = false;
-
-	/*Export PublicKey and send it to server.*/
-	CApi_client.GenerateExchangeKey();
-	CApi_client.PublicKey = CApi_client.ExportKey(
-												CApi_client.hExchangeKey,
-												0,
-												PUBLICKEYBLOB,
-												&CApi_client.pbLen);
 	char pbKeyBuf[2048];
-	memcpy(pbKeyBuf, (char*)&CApi_client.pbLen, sizeof(DWORD));
-	memcpy(pbKeyBuf + sizeof(DWORD), (char*)CApi_client.PublicKey, CApi_client.pbLen * sizeof(BYTE));
-	send_pack(pbKeyBuf, sizeof(DWORD) + CApi_client.pbLen * sizeof(BYTE));
+	WORD offset = 0;
+
+	/*Generate two session keys.*/
+	for (WORD keynum = 0; keynum < 2; keynum++)
+	{
+		/*Export two PublicKey's.*/
+		CApi_client[keynum].GenerateExchangeKey();
+		CApi_client[keynum].PublicKey = CApi_client[keynum].ExportKey
+		(
+			CApi_client[keynum].hExchangeKey,
+			0,
+			PUBLICKEYBLOB,
+			&CApi_client[keynum].pbLen
+		);
+
+		/*Copy two public keys into send buffer.*/
+		memcpy
+		(
+			pbKeyBuf + offset, 
+			(char*)&CApi_client[keynum].pbLen, 
+			sizeof(DWORD)
+		);
+		offset += sizeof(DWORD);
+
+		memcpy
+		(
+			pbKeyBuf + offset, 
+			(char*)CApi_client[keynum].PublicKey,
+			CApi_client[keynum].pbLen * sizeof(BYTE)
+		);
+		offset += CApi_client[keynum].pbLen * sizeof(BYTE);
+	}
+
+	/*Send two public keys.*/
+	send_pack(pbKeyBuf, offset, 0);
 
 	/*Recieve Session Key encrypted with Public Key*/
-	recieve_pack();
-	memcpy((char*)&CApi_client.sLen, req_buffer, sizeof(DWORD));
-	CApi_client.enSessionKey = new BYTE[CApi_client.sLen];
-	memcpy(CApi_client.enSessionKey, req_buffer + sizeof(DWORD), sizeof(BYTE)*CApi_client.sLen);
+	recieve_pack(1);
 
-	/*Decrypt Session Key with Public Key*/
-	CApi_client.DecryptAndImportSessionKey();	
+	offset = 0;
+	for (WORD keynum = 0; keynum < 2; keynum++)
+	{
+		memcpy
+		(
+			(char*)&CApi_client[keynum].sLen,
+			req_buffer + offset,
+			sizeof(DWORD)
+		);
+		offset += sizeof(DWORD);
+
+		CApi_client[keynum].enSessionKey = new BYTE[CApi_client[keynum].sLen];
+
+		memcpy
+		(
+			CApi_client[keynum].enSessionKey,
+			req_buffer + offset,
+			sizeof(BYTE)*CApi_client[keynum].sLen
+		);
+		offset += sizeof(BYTE)*CApi_client[keynum].sLen;
+
+		/*Decrypt Session Key's with Public Key's*/
+		CApi_client[keynum].DecryptAndImportSessionKey();
+	}
 
 	is_sKey_establish = true;
 }
 
 void RequestHandler::get_systime()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	unsigned opcode = GET_CTIME;
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 	
 	SYSTEMTIME sm;
 	memcpy(&sm, req_buffer, sizeof(sm));
@@ -234,14 +277,13 @@ void RequestHandler::get_systime()
 }
 void RequestHandler::get_osb_time()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	unsigned opcode = GET_OSBTIME;
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 
 	cout << "System time : ";
 	for (int i = 0; i < 4; i++)
@@ -256,15 +298,14 @@ void RequestHandler::get_osb_time()
 }
 void RequestHandler::get_osver()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	unsigned opcode = GET_OSVER;
 
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 
 	OSVERSIONINFOEX osvi;
 	memcpy((char*)&osvi, req_buffer, sizeof(OSVERSIONINFOEX));
@@ -274,15 +315,14 @@ void RequestHandler::get_osver()
 }
 void RequestHandler::get_meminf()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	unsigned opcode = GET_MEMINF;
 
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 
 	MEMORYSTATUS stat;
 	memcpy((char*)&stat, req_buffer, sizeof(MEMORYSTATUS));
@@ -301,15 +341,14 @@ void RequestHandler::get_meminf()
 }
 void RequestHandler::get_freemem()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	unsigned opcode = GET_FREEMEM;
 
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 
 	unsigned disk_amount;
 	memcpy((char*)&disk_amount, req_buffer, sizeof(unsigned));
@@ -330,7 +369,7 @@ void RequestHandler::get_freemem()
 }
 void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 {
-	establish_session_key();
+	establish_session_keys();
 
 	setlocale(0, "RUS");
 	char tmp[128];
@@ -347,15 +386,16 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 	offset += sizeof(unsigned short) + item_len;
 
 	make_request(opcode, (char*)tmp, offset);
-	send_pack(req_buffer, offset + sizeof(unsigned));
+	send_pack(req_buffer, offset + sizeof(unsigned), 0);
+
+
+	/*Receive information pack.*/
+	recieve_pack(1);
 
 	/*Receive error code of operation.*/
 	DWORD err;
-
-	establish_session_key();
-	recieve_pack();
-
 	memcpy((char*)&err, req_buffer, sizeof(DWORD));
+	offset = sizeof(DWORD);
 
 	if (err != ERROR_SUCCESS)
 	{
@@ -365,19 +405,20 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 		return;
 	}
 
-	/*Receive information pack.*/
-	establish_session_key();
-	recieve_pack();
-
 	if (opcode == GET_OWNER)
 	{
 		ACEitem acei;
 		DWORD SidLength;
-		memcpy((char*)&SidLength, req_buffer, sizeof(DWORD));
+		memcpy((char*)&SidLength, req_buffer + offset, sizeof(DWORD));
 
 		LPSTR StringSid = new CHAR[SidLength];
-		memcpy((char*)&acei, &req_buffer[sizeof(DWORD)], sizeof(ACEitem));
-		memcpy(StringSid, &req_buffer[sizeof(DWORD)] + sizeof(ACEitem), SidLength);
+		memcpy((char*)&acei, &req_buffer[sizeof(DWORD)] + offset, sizeof(ACEitem));
+		memcpy
+		(
+			StringSid, 
+			&req_buffer[sizeof(DWORD)] + sizeof(ACEitem) + offset, 
+			SidLength
+		);
 
 		cout << "\nOwner:" << endl;
 		cout << "SID: " << StringSid << endl;
@@ -389,9 +430,8 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 	}
 
 	WORD aceamount = 0;
-	offset = sizeof(WORD);
-
-	memcpy((char*)&aceamount, req_buffer, offset);
+	memcpy((char*)&aceamount, req_buffer + offset, sizeof(WORD));
+	offset += sizeof(WORD);
 
 	cout << "\nAccess Control List:\n" << endl;
 	for (WORD i = 0; i < aceamount; i++)
@@ -400,8 +440,10 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 		DWORD SidLength;
 		memcpy((char*)&acei, req_buffer + offset, sizeof(ACEitem));
 		offset += sizeof(ACEitem);
+
 		memcpy((char*)&SidLength, req_buffer + offset, sizeof(DWORD));
 		offset += sizeof(DWORD);
+
 		LPSTR StringSid = new CHAR[SidLength];
 		memcpy(StringSid, req_buffer + offset, SidLength);
 		offset += SidLength;
@@ -421,7 +463,7 @@ void RequestHandler::get_accrights(unsigned opcode, string cmd, string item)
 }
 void RequestHandler::get_disktypes()
 {
-	establish_session_key();
+	establish_session_keys();
 
 	const char *DT[] = {
 	{  "DRIVE_UNKNOWN" },
@@ -434,10 +476,9 @@ void RequestHandler::get_disktypes()
 	unsigned opcode = GET_DISKTYPES;
 
 	make_request(opcode, NULL, 0);
-	send_pack(req_buffer, strlen(req_buffer));
+	send_pack(req_buffer, strlen(req_buffer), 0);
 
-	establish_session_key();
-	recieve_pack();
+	recieve_pack(1);
 
 	WORD disk_amount, offset = sizeof(WORD);
 	memcpy((char*)&disk_amount, req_buffer, sizeof(WORD));
