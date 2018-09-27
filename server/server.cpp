@@ -16,7 +16,8 @@ struct client
 {
 	client() : is_sKey_establish(false) {}
 
-	CryptoAPI capi;
+	/*Two session keys. For send and recieve.*/
+	CryptoAPI capi[2];
 	bool is_sKey_establish;
 
 	SOCKET sock;
@@ -27,7 +28,6 @@ struct client
 	OVERLAPPED overlap_encr;
 
 	char request[2048];
-	char keybuf[2048];
 
 	const char *ip;
 	unsigned port;
@@ -155,34 +155,67 @@ private:
 	void send_disktypes(client *c);
 
 	//Crypter
-	void establish_session_key(client *c);
+	void establish_session_keys(client *c);
 	void wait_pbKey(client *c);
 };
 
-void RequestHandler::establish_session_key(client *c)
+/*recieve only 0, send only 1*/
+void RequestHandler::establish_session_keys(client *c)
 {
-	/*Recieve Public key from client*/
-	memcpy((char*)&c->capi.pbLen, c->keybuf, sizeof(DWORD));
-	c->capi.PublicKey = new BYTE[c->capi.pbLen];
-	memcpy(c->capi.PublicKey, c->keybuf + sizeof(DWORD), c->capi.pbLen * sizeof(BYTE));
+	WORD offset = 0;
+	/*Recieve Public keys from client*/
+	for (WORD keynum = 0; keynum < 2; keynum++)
+	{
+		/*Recieve pbKey size.*/
+		memcpy
+		(
+			(char*)&c->capi[keynum].pbLen, 
+			c->request + offset,
+			sizeof(DWORD)
+		);
+		offset += sizeof(DWORD);
 
-	c->capi.GenerateSessionKey();
-	c->capi.EncryptAndExportSessionKey();
+		c->capi[keynum].PublicKey = new BYTE[c->capi[keynum].pbLen];
+
+		/*Recieve pbKey BLOB.*/
+		memcpy
+		(
+			c->capi[keynum].PublicKey, 
+			c->request + offset,
+			c->capi[keynum].pbLen * sizeof(BYTE)
+		);
+		offset += c->capi[keynum].pbLen * sizeof(BYTE);
+
+		/*Exports session key's.*/
+		c->capi[keynum].GenerateSessionKey();
+		c->capi[keynum].EncryptAndExportSessionKey();
+	}
 
 	/*Send session key encrypted with public key to client.*/
 	char sKeyBuf[2048];
-	memcpy(sKeyBuf, (char*)&c->capi.sLen, sizeof(DWORD));
-	memcpy(sKeyBuf + sizeof(DWORD), (char*)c->capi.enSessionKey, c->capi.sLen * sizeof(BYTE));
-	send_pack(c, sKeyBuf, sizeof(DWORD) + c->capi.sLen * sizeof(BYTE));
+	offset = 0;
+	for (WORD keynum = 0; keynum < 2; keynum++)
+	{
+		memcpy
+		(
+			sKeyBuf + offset, 
+			(char*)&c->capi[keynum].sLen, 
+			sizeof(DWORD)
+		);
+		offset += sizeof(DWORD);
+
+		memcpy
+		(
+			sKeyBuf + offset,
+			(char*)c->capi[keynum].enSessionKey, 
+			c->capi[keynum].sLen * sizeof(BYTE)
+		);
+		offset += c->capi[keynum].sLen * sizeof(BYTE);
+	}
+
+	send_pack(c, sKeyBuf, offset);
 
 	c->is_sKey_establish = true;
-}
-
-void RequestHandler::wait_pbKey(client * c)
-{
-	DWORD bytes_tr, flags;
-	Sleep(100);
-	WSAGetOverlappedResult(c->sock, &c->overlap_encr, &bytes_tr, TRUE, &flags);
 }
 
 void RequestHandler::send_pack(client *c, char *buffer, ULONG buf_size)
@@ -194,7 +227,7 @@ void RequestHandler::send_pack(client *c, char *buffer, ULONG buf_size)
 	if (c->is_sKey_establish == true)
 	{
 		DWORD encr_size = buf_size;
-		encrypted_buf = c->capi.EncryptBuffer((PBYTE)buffer, (DWORD)buf_size, &encr_size);
+		encrypted_buf = c->capi[1].EncryptBuffer((PBYTE)buffer, (DWORD)buf_size, &encr_size);
 		buf.buf = (char*)encrypted_buf;
 		buf.len = encr_size;
 	}
@@ -214,15 +247,11 @@ void RequestHandler::handle_request(TCPServer &s, client *c, DWORD RecvBytes)
 {
 	if (c->is_sKey_establish == false)
 	{
-		memcpy(c->keybuf, c->request, 2048);
-		establish_session_key(c);
+		establish_session_keys(c);
 		return;
 	}
 
-	c->capi.DecryptBuffer((PBYTE)c->request, &RecvBytes);
-	c->is_sKey_establish = false;
-
-	s.schedule_pubKey(c);
+	c->capi[0].DecryptBuffer((PBYTE)c->request, &RecvBytes);
 
 	unsigned opcode;
 	memcpy((char*)&opcode, c->request, sizeof(unsigned));
@@ -263,8 +292,7 @@ void RequestHandler::send_systime(client *c)
 	SYSTEMTIME sm;
 	GetSystemTime(&sm);
 
-	wait_pbKey(c);
-	establish_session_key(c);
+	sm.wHour += 3;
 
 	send_pack(c, (char*)&sm, sizeof(sm));
 	c->is_sKey_establish = false;
@@ -277,10 +305,7 @@ void RequestHandler::send_osbtime(client *c)
 	osbtime[1] = osbtime[3] / (1000 * 60) - osbtime[0] * 60;
 	osbtime[2] = (osbtime[3] / 1000) - (osbtime[0] * 60 * 60) - osbtime[1] * 60;
 	osbtime[3] = osbtime[3] - osbtime[0] * 60 * 60 * 1000 - osbtime[1] * 60 * 1000 - osbtime[2] * 1000;
-	
-	wait_pbKey(c);
-	establish_session_key(c);
-	
+		
 	send_pack(c, (char*)&osbtime, sizeof(DWORD) * 4);
 	c->is_sKey_establish = false;
 }
@@ -292,9 +317,6 @@ void RequestHandler::send_osver(client *c)
 	osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
 	GetVersionEx((LPOSVERSIONINFOA)&osvi);
 
-	wait_pbKey(c);
-	establish_session_key(c);
-
 	send_pack(c, (char*)&osvi, sizeof(OSVERSIONINFOEX));
 	c->is_sKey_establish = false;
 }
@@ -302,9 +324,6 @@ void RequestHandler::send_meminf(client *c)
 {
 	MEMORYSTATUS stat;
 	GlobalMemoryStatus(&stat);
-
-	wait_pbKey(c);
-	establish_session_key(c);
 
 	send_pack(c, (char*)&stat, sizeof(MEMORYSTATUS));
 	c->is_sKey_establish = false;
@@ -340,9 +359,6 @@ void RequestHandler::send_freemem(client *c)
 	}
 
 	memcpy(send_buf, (char*)&dam, sizeof(unsigned));
-
-	wait_pbKey(c);
-	establish_session_key(c);
 
 	send_pack(c, (char*)&send_buf, sizeof(unsigned) + dam * (3 + sizeof(long double)));
 	c->is_sKey_establish = false;
@@ -399,9 +415,6 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 										&ppSD);
 	char buffer[2048];
 
-	wait_pbKey(c);
-	establish_session_key(c);
-
 	if (retval != ERROR_SUCCESS)
 	{
 		memcpy(buffer, (char*)&retval, sizeof(DWORD));
@@ -424,10 +437,8 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 			&DomainBufferSize,
 			&eSidType))
 		{
-			send_pack(c, (char*)&retval, sizeof(retval));
-			c->is_sKey_establish = false;
-
-			s.schedule_pubKey(c);
+			memcpy(buffer, (char*)&retval, sizeof(retval));
+			offset = sizeof(retval);
 
 			ACEitem acei;
 			LPSTR StringSid;
@@ -448,14 +459,17 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 			memcpy(acei.Name, Name, (NameBufferSize + 1) * sizeof(CHAR));
 			acei.SidType = eSidType;
 
-			memcpy(buffer, (char*)&SidLength, sizeof(DWORD));
-			memcpy(buffer + sizeof(DWORD), (char*)&acei, sizeof(ACEitem));
-			memcpy(buffer + sizeof(ACEitem) + sizeof(DWORD), StringSid, SidLength);
+			memcpy(buffer + offset, (char*)&SidLength, sizeof(DWORD));
+			memcpy(buffer + sizeof(DWORD) + offset, (char*)&acei, sizeof(ACEitem));
+			memcpy
+			(
+				buffer + sizeof(ACEitem) + sizeof(DWORD) + offset, 
+				StringSid, 
+				SidLength
+			);
 			delete StringSid;
 
-			wait_pbKey(c);
-			establish_session_key(c);
-			send_pack(c, buffer, sizeof(DWORD) + sizeof(ACEitem) + SidLength);
+			send_pack(c, buffer, offset + sizeof(DWORD) + sizeof(ACEitem) + SidLength);
 		}
 		else
 		{
@@ -485,15 +499,12 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 	}
 
 	/*Send error_code = 0*/
-	send_pack(c, (char*)&retval, sizeof(retval));
-	c->is_sKey_establish = false;
-
-	s.schedule_pubKey(c);
+	memcpy(buffer, (char*)&retval, sizeof(retval));
 
 	ACCESS_ALLOWED_ACE * pAce = NULL;
 	WORD aceamount = 0;
 
-	offset = sizeof(WORD);
+	offset = sizeof(DWORD) + sizeof(WORD);
 	setlocale(0, "RUS");
 	for (DWORD cAce = 0; cAce < aclsizeinfo.AceCount; cAce++)
 	{
@@ -536,14 +547,11 @@ void RequestHandler::send_accrights(unsigned opcode, client *c, TCPServer &s)
 		}
 	}
 
-	memcpy(buffer, (char*)&aceamount, sizeof(WORD));
-
-	wait_pbKey(c);
-	establish_session_key(c);
+	memcpy(buffer + sizeof(DWORD), (char*)&aceamount, sizeof(WORD));
 
 	send_pack(c, buffer, offset);
-	c->is_sKey_establish = false;
 
+	c->is_sKey_establish = false;
 	LocalFree(ppSD);
 }
 void RequestHandler::send_disktypes(client *c)
@@ -580,9 +588,6 @@ void RequestHandler::send_disktypes(client *c)
 		}
 	}
 	memcpy(buffer, (char*)&disk_amount, sizeof(WORD));
-
-	wait_pbKey(c);
-	establish_session_key(c);
 
 	send_pack(c, buffer, offset);
 	c->is_sKey_establish = false;
@@ -706,26 +711,7 @@ void TCPServer::schedule_cancel(client *c)
 		cout << "Exception in: " << e.what() << endl;
 	}
 }
-void TCPServer::schedule_pubKey(client * c)
-{
-	DWORD flags = 0;
-	WSABUF buffer;
 
-	ZeroMemory(c->keybuf, sizeof(char) * 2048);
-	buffer.buf = c->keybuf;
-	buffer.len = 2048 * sizeof(char);
-
-	clean_olp(c->overlap_encr);
-	try
-	{
-		WSARecv(c->sock, &buffer, 1, NULL, &flags, &c->overlap_encr, NULL);
-		error_msg("WSARecv");
-	}
-	catch (const std::exception &e)
-	{
-		cout << "Exception in: " << e.what() << endl;
-	}
-}
 void TCPServer::accept_handler()
 {
 	client *new_cli = new client;
