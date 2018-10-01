@@ -18,8 +18,8 @@ CryptoAPI::CryptoAPI()
 CryptoAPI::~CryptoAPI()
 {
 	CryptReleaseContext(hProv, 0);
-	CryptDestroyKey(hExchangeKey);
-	CryptDestroyKey(SessionKey);
+	if (hExchangeKey != 0) CryptDestroyKey(hExchangeKey);
+	if (SessionKey != 0) CryptDestroyKey(SessionKey);
 
 	if (enSessionKey != NULL) delete [] enSessionKey;
 	if (PublicKey != NULL) delete [] PublicKey;

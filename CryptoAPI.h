@@ -29,10 +29,10 @@ public:
 	HCRYPTKEY SessionKey;
 	HCRYPTKEY hExchangeKey;
 
-	BYTE *enSessionKey;
+	BYTE *enSessionKey = NULL;
 	DWORD sLen;
 
-	BYTE *PublicKey;
+	BYTE *PublicKey = NULL;
 	DWORD pbLen;
 };
 
