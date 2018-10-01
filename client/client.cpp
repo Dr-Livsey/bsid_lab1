@@ -25,9 +25,17 @@ class TCPSocket
 {
 public:
 	TCPSocket();
-	~TCPSocket() { closesocket(s); }
+	~TCPSocket() 
+	{ 
+		closesocket(s);
 
-	void terminate();
+		cout << endl << "Client terminating";
+		for (int i = 0; i < 3;i++)
+		{
+			Sleep(200);
+			cout << ".";
+		}
+	}
 	void connect_to_server(const char *ip, unsigned port);
 	SOCKET get_sock() { return s; }
 
@@ -48,17 +56,7 @@ TCPSocket::TCPSocket()
 		cout << "Exception in: " << e.what() << endl;
 	}
 }
-void TCPSocket::terminate()
-{
-	closesocket(s);
 
-	cout << endl << "Client terminating";
-	for (int i = 0; i < 3;i++)
-	{
-		Sleep(200);
-		cout << ".";
-	}
-}
 void TCPSocket::set_sockaddr(DWORD ip, unsigned short port, sockaddr_in &si)
 {
 	memset(si.sin_zero, 0, 8 * sizeof(char));
@@ -554,7 +552,6 @@ int main(int argc, char *argv[])
 		if (string(e.what()) == "refused")
 		{
 			deinitWSASockets();
-			client.terminate();
 			return EXIT_FAILURE;
 		}
 	}
@@ -600,8 +597,6 @@ int main(int argc, char *argv[])
 
 	}
 
-
-	client.terminate();
 	deinitWSASockets();
 	return EXIT_SUCCESS;
 }
