@@ -50,7 +50,6 @@ class TCPServer
 public:
 	HANDLE iocp;
 	HANDLE tiocp;
-	HANDLE crypt_iocp;
 	SOCKET s;
 
 	TCPServer(unsigned port)
@@ -104,8 +103,20 @@ public:
 
 	void schedule_accept();
 	void schedule_request(client *c);
-	void schedule_cancel(client *c);
-	void schedule_pubKey(client *c);
+	void schedule_cancel(client *c)
+	{
+		CancelIo((HANDLE)c->sock);
+		ZeroMemory(&c->overlap_c, sizeof(OVERLAPPED));
+		try
+		{
+			PostQueuedCompletionStatus(iocp, 0, (ULONG_PTR)c->sock, &c->overlap_c);
+			error_msg("PostQueuedCompletionStatus");
+		}
+		catch (const std::exception &e)
+		{
+			cout << "Exception in: " << e.what() << endl;
+		}
+	}
 
 	void accept_handler();
 
@@ -123,7 +134,6 @@ public:
 		CloseHandle(threads[1]);
 		CloseHandle(iocp);
 		CloseHandle(tiocp);
-		CloseHandle(crypt_iocp);
 	}
 
 private:
@@ -611,21 +621,23 @@ DWORD WINAPI TCPServer::PoolWorking(LPVOID server)
 			&lpCompletionKey,
 			&olp,
 			INFINITE);
-	
+
 		if (retval == true)
 		{
 			client *cur_client = pServer->get_client(lpCompletionKey);
-
+			
 			if (&cur_client->overlap_r == olp)
 			{
 				if (!transfered)
 				{
 					ZeroMemory(&cur_client->overlap_c, sizeof(OVERLAPPED));
-					PostQueuedCompletionStatus(pServer->iocp, 
-												1, 
-												(ULONG_PTR)cur_client->sock,
-												&cur_client->overlap_c);
-					
+					PostQueuedCompletionStatus
+					(
+						pServer->iocp,
+						1,
+						(ULONG_PTR)cur_client->sock,
+						&cur_client->overlap_c
+					);
 				}
 				else
 				{
@@ -633,6 +645,19 @@ DWORD WINAPI TCPServer::PoolWorking(LPVOID server)
 					pServer->schedule_request(cur_client);
 				}
 			}
+		}
+		else if (ERROR_NETNAME_DELETED == GetLastError())
+		{
+			client *cur_client = pServer->get_client(lpCompletionKey);
+
+			ZeroMemory(&cur_client->overlap_c, sizeof(OVERLAPPED));
+			PostQueuedCompletionStatus
+			(
+				pServer->iocp, 
+				1, 
+				(ULONG_PTR)cur_client->sock, 
+				&cur_client->overlap_c
+			);
 		}
 
 	}
@@ -691,20 +716,6 @@ void TCPServer::schedule_request(client *c)
 	{
 		WSARecv(c->sock, &buffer, 1, NULL, &flags, &c->overlap_r, NULL);
 		error_msg("WSARecv");
-	}
-	catch (const std::exception &e)
-	{
-		cout << "Exception in: " << e.what() << endl;
-	}
-}
-void TCPServer::schedule_cancel(client *c)
-{
-	CancelIo((HANDLE)c->sock);
-	ZeroMemory(&c->overlap_c, sizeof(OVERLAPPED));
-	try
-	{
-		PostQueuedCompletionStatus(iocp, 0, (ULONG_PTR)c->sock, &c->overlap_c);
-		error_msg("PostQueuedCompletionStatus");
 	}
 	catch (const std::exception &e)
 	{
@@ -810,6 +821,5 @@ int main()
 	}
 
 	deinitWSASockets();
-	_getch();
 	return EXIT_SUCCESS;
 }
